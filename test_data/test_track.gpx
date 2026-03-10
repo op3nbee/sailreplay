@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Test GPS">
+  <trk>
+    <name>Test Boat Track</name>
+    <trkseg>
+      <trkpt lat="38.8891" lon="-77.0405"><time>2026-03-09T14:00:00Z</time></trkpt>
+      <trkpt lat="38.8895" lon="-77.0390"><time>2026-03-09T14:00:30Z</time></trkpt>
+      <trkpt lat="38.8900" lon="-77.0375"><time>2026-03-09T14:01:00Z</time></trkpt>
+      <trkpt lat="38.8905" lon="-77.0360"><time>2026-03-09T14:01:30Z</time></trkpt>
+      <trkpt lat="38.8910" lon="-77.0345"><time>2026-03-09T14:02:00Z</time></trkpt>
+    </trkseg>
+  </trk>
+</gpx>

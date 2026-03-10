@@ -1,0 +1,764 @@
+import { useEffect, useRef, useState } from 'react'
+import L from 'leaflet'
+import { gpx as parseGPX } from '@tmcw/togeojson'
+import { DOMParser } from 'xmldom'
+
+interface Boat {
+  id: number
+  name: string
+  color: string
+  boat_type?: string
+}
+
+// Boat dimensions for scaling (in meters)
+// FJ (Flying Junior): 13'3" = 4.04m length, 4'11" = 1.5m beam
+// 420 (Club 420): 13.9' = 4.24m length, 5.5' = 1.68m beam
+const BOAT_DIMENSIONS: Record<string, { length: number; beam: number }> = {
+  'FJ': { length: 4.04, beam: 1.5 },
+  '420': { length: 4.24, beam: 1.68 },
+}
+
+// At higher zoom, each pixel represents less ground distance, so objects appear larger
+function metersToPixels(meters: number, zoom: number): number {
+  const pixelsPerMeter = (256 * Math.pow(2, zoom)) / 40075016
+  return meters * pixelsPerMeter
+}
+
+// Create boat hull icon using PNG images with color tinting and rotation
+// Returns HTML for use in L.divIcon
+function createBoatIcon(boatType: string, color: string, pixelWidth: number, pixelHeight: number, rotation: number = 0): string {
+  // PNG file path (served from public folder)
+  const imageFile = boatType === '420' ? '/420-model.png' : '/fj-model.png'
+  
+  // The PNG images are oriented correctly, no rotation adjustment needed
+  const adjustedRotation = rotation
+  
+  // Use CSS mask to apply color to black silhouette:
+  // The image is used as a mask (only opaque parts show)
+  // Background-color shows through the mask
+  const html = `
+    <div style="
+      width: ${pixelWidth}px; 
+      height: ${pixelHeight}px; 
+      transform: rotate(${adjustedRotation}deg);
+      transform-origin: center center;
+      -webkit-mask-image: url('${imageFile}');
+      -webkit-mask-size: contain;
+      -webkit-mask-repeat: no-repeat;
+      -webkit-mask-position: center;
+      mask-image: url('${imageFile}');
+      mask-size: contain;
+      mask-repeat: no-repeat;
+      mask-position: center;
+      background-color: ${color};
+      border: none;
+      margin: 0;
+      padding: 0;
+    "></div>
+  `.trim()
+  
+  return html
+}
+
+// Icon cache to avoid recreating icons every frame
+const iconCache = new Map<string, string>()
+function getCachedIcon(boatType: string, color: string, pixelWidth: number, pixelHeight: number, rotation: number): string {
+  // Create a unique key based on boat type, color, size, and rotation (rounded to 5 degrees)
+  const key = `${boatType}-${color}-${Math.round(pixelWidth)}-${Math.round(pixelHeight)}-${Math.round(rotation / 5) * 5}`
+  if (!iconCache.has(key)) {
+    iconCache.set(key, createBoatIcon(boatType, color, pixelWidth, pixelHeight, rotation))
+  }
+  return iconCache.get(key)!
+}
+
+// Get icon size based on boat type and zoom level (returns [width, height] in pixels)
+function getIconSize(boatType: string, zoom: number): [number, number] {
+  const dimensions = BOAT_DIMENSIONS[boatType] || BOAT_DIMENSIONS['FJ']
+  
+  // Convert real-world dimensions to pixels at current zoom
+  const pixelLength = metersToPixels(dimensions.length, zoom)
+  const pixelBeam = metersToPixels(dimensions.beam, zoom)
+  
+  // Return [width, height] - PNG images are vertical (height > width)
+  return [Math.round(pixelBeam), Math.round(pixelLength)]
+}
+
+interface TrackPoint {
+  lat: number
+  lng: number
+  time: Date | null
+  speed?: number
+  heading?: number
+}
+
+// Simple moving average filter for smoothing heading changes
+class HeadingSmoother {
+  private window: number[] = []
+  private windowSize: number
+  
+  constructor(windowSize: number = 5) {
+    this.windowSize = windowSize
+  }
+  
+  add(heading: number): number {
+    this.window.push(heading)
+    if (this.window.length > this.windowSize) {
+      this.window.shift()
+    }
+    return this.getAverage()
+  }
+  
+  private getAverage(): number {
+    if (this.window.length === 0) return 0
+    
+    // Use circular average for headings
+    let sinSum = 0
+    let cosSum = 0
+    for (const h of this.window) {
+      const rad = h * Math.PI / 180
+      sinSum += Math.sin(rad)
+      cosSum += Math.cos(rad)
+    }
+    return (Math.atan2(sinSum, cosSum) * 180 / Math.PI + 360) % 360
+  }
+  
+  reset() {
+    this.window = []
+  }
+}
+
+// Per-boat heading smoothers
+const headingSmoothers = new Map<number, HeadingSmoother>()
+
+interface BoatTrack {
+  boat: Boat
+  points: TrackPoint[]
+  polyline: L.Polyline | null
+  marker: L.Marker | null
+}
+
+interface MapReplayProps {
+  practiceId: number
+  boats: Boat[]
+  onBoatUpdate?: (boatId: number, updates: Partial<Boat>) => void
+}
+
+function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
+  const mapContainer = useRef<HTMLDivElement>(null)
+  const mapRef = useRef<L.Map | null>(null)
+  const [boatTracks, setBoatTracks] = useState<BoatTrack[]>([])
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [currentTime, setCurrentTime] = useState<number>(0)
+  const [playbackSpeed, setPlaybackSpeed] = useState(1)
+  const [duration, setDuration] = useState(0)
+  const [startTime, setStartTime] = useState<Date | null>(null)
+  const [endTime, setEndTime] = useState<Date | null>(null)
+  const [currentBoatSpeeds, setCurrentBoatSpeeds] = useState<Record<number, { speed: number; heading: number }>>({})
+  const animationRef = useRef<number | null>(null)
+  const lastTimeRef = useRef<number>(0)
+  const boatsRef = useRef(boats) // Keep track of current boats with updated colors
+  const markersRef = useRef<Map<number, L.Marker>>(new Map())
+  const zoomRef = useRef<number>(12) // Track current zoom level for icon sizing
+  const rotationRef = useRef<Map<number, number>>(new Map()) // Track current rotation per boat
+  const [currentZoom, setCurrentZoom] = useState(12)
+  const [showTracks, setShowTracks] = useState(true)
+
+  // Keep boats ref updated
+  useEffect(() => {
+    boatsRef.current = boats
+  }, [boats])
+
+  // Initialize map
+  useEffect(() => {
+    if (!mapContainer.current || mapRef.current) return
+
+    mapRef.current = L.map(mapContainer.current, {
+      center: [38.9, -77.0], // Default to DC area
+      zoom: 12,
+      minZoom: 10,
+      maxZoom: 22,
+      zoomControl: true
+    })
+
+    // Base layer - OpenStreetMap (lighter than satellite)
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap',
+      maxZoom: 22  // Allow deep zoom
+    }).addTo(mapRef.current)
+
+    // Add OpenSeaMap nautical overlay
+    L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png', {
+      attribution: '© OpenSeaMap',
+      maxZoom: 18
+    }).addTo(mapRef.current)
+
+    // Track zoom changes for icon scaling
+    mapRef.current.on('zoomend', () => {
+      if (mapRef.current) {
+        const zoom = Math.round(mapRef.current.getZoom())
+        zoomRef.current = zoom
+        setCurrentZoom(zoom)
+      }
+    })
+
+    return () => {
+      if (mapRef.current) {
+        mapRef.current.remove()
+        mapRef.current = null
+      }
+    }
+  }, [])
+
+  // Load GPX tracks for all boats
+  useEffect(() => {
+    if (!boats.length) return
+
+    const loadTracks = async () => {
+      const tracks: BoatTrack[] = []
+
+      for (const boat of boats) {
+        try {
+          console.log(`Loading GPX for boat ${boat.id} (${boat.name}), color: ${boat.color}`)
+          const res = await fetch(`/api/practices/${practiceId}/boats/${boat.id}/gpx`)
+          if (!res.ok) {
+            console.error(`Failed to fetch GPX: ${res.status}`)
+            continue
+          }
+
+          const gpxText = await res.text()
+          console.log(`GPX data length: ${gpxText.length}`)
+          
+          const parser = new DOMParser()
+          const gpxDoc = parser.parseFromString(gpxText, 'application/xml')
+          const geojson = parseGPX(gpxDoc)
+          
+          console.log('GeoJSON properties:', JSON.stringify(geojson.features?.[0]?.properties).substring(0, 500))
+
+          const points: TrackPoint[] = []
+          
+          if (geojson.features && geojson.features[0]) {
+            const feature = geojson.features[0]
+            const coords = (feature.geometry as any)?.coordinates
+            const props = feature.properties as any
+            
+            // togeojson stores times in coordinateProperties.times
+            const coordProps = props?.coordinateProperties
+            const times = coordProps?.times
+
+            if (coords && Array.isArray(coords)) {
+              console.log(`Coords length: ${coords.length}`)
+              console.log(`Times: ${times ? times.length + ' items' : 'NONE'}, first: ${times?.[0]}`)
+              
+              for (let i = 0; i < coords.length; i++) {
+                const coord = coords[i]
+                // GPX toGeoJSON gives [lng, lat] pairs
+                let point: TrackPoint = {
+                  lat: coord[1],
+                  lng: coord[0],
+                  time: null
+                }
+
+                // Parse time from coordinateProperties.times array
+                if (times && times[i]) {
+                  const timeStr = times[i]
+                  if (typeof timeStr === 'string') {
+                    point.time = new Date(timeStr)
+                  } else if (timeStr instanceof Date) {
+                    point.time = timeStr
+                  }
+                }
+
+                // Calculate speed and heading from previous point
+                if (i > 0 && point.time) {
+                  const prevPoint = points[i-1]
+                  if (prevPoint.time) {
+                    const map = mapRef.current
+                    const dist = map ? map.distance(
+                      [prevPoint.lat, prevPoint.lng],
+                      [point.lat, point.lng]
+                    ) : 0
+                    const timeDiff = (point.time.getTime() - prevPoint.time.getTime()) / 1000 // seconds
+                    if (timeDiff > 0) {
+                      point.speed = (dist / timeDiff) * 1.94384 // m/s to knots
+                    }
+
+                    // Heading: direction from previous to current point
+                    const dLat = point.lat - prevPoint.lat
+                    const dLng = point.lng - prevPoint.lng
+                    point.heading = (Math.atan2(dLng, dLat) * 180 / Math.PI + 360) % 360
+                  }
+                }
+
+                points.push(point)
+              }
+            }
+
+          console.log(`Parsed ${points.length} points, ${points.filter(p => p.time).length} have times`)
+          
+          tracks.push({
+            boat,
+            points,
+            polyline: null,
+            marker: null
+          })
+        } catch (err) {
+          console.error(`Failed to load GPX for boat ${boat.id}:`, err)
+        }
+      }
+
+      // Calculate duration
+      let minTimeVal: number | null = null
+      let maxTimeVal: number | null = null
+      
+      tracks.forEach(track => {
+        track.points.forEach(p => {
+          if (p.time) {
+            const pt = p.time.getTime()
+            if (minTimeVal === null || pt < minTimeVal) minTimeVal = pt
+            if (maxTimeVal === null || pt > maxTimeVal) maxTimeVal = pt
+          }
+        })
+      })
+
+      const minTime = minTimeVal ? new Date(minTimeVal) : null
+      const maxTime = maxTimeVal ? new Date(maxTimeVal) : null
+      
+      setStartTime(minTime)
+      setEndTime(maxTime)
+      
+      if (minTime && maxTime) {
+        setDuration(maxTime.getTime() - minTime.getTime())
+        setCurrentTime(0)
+      }
+
+      setBoatTracks(tracks)
+
+      // Fit map to bounds
+      if (mapRef.current && tracks.length > 0) {
+        const allPoints = tracks.flatMap(t => t.points.map(p => [p.lat, p.lng] as [number, number]))
+        if (allPoints.length > 0) {
+          const bounds = L.latLngBounds(allPoints)
+          mapRef.current.fitBounds(bounds, { padding: [50, 50] })
+        }
+      }
+    }
+
+    loadTracks()
+  }, [practiceId]) // Only reload when practiceId changes, not when boats change
+
+  // Draw tracks on map
+  useEffect(() => {
+    if (!mapRef.current || boatTracks.length === 0) return
+
+    const newTracks = [...boatTracks]
+
+    newTracks.forEach((track) => {
+      if (track.polyline) {
+        track.polyline.remove()
+      }
+      if (track.marker) {
+        track.marker.remove()
+        markersRef.current.delete(track.boat.id)
+      }
+
+      // Draw the full track as a thin line
+      const latlngs = track.points.map(p => [p.lat, p.lng] as L.LatLngTuple)
+      track.polyline = L.polyline(latlngs, {
+        color: track.boat.color,
+        weight: 2,
+        opacity: showTracks ? 0.5 : 0
+      }).addTo(mapRef.current!)
+
+      // Add boat marker using custom SVG icon
+      if (latlngs.length > 0) {
+        const boatType = track.boat.boat_type || 'FJ'
+        const zoom = mapRef.current ? Math.round(mapRef.current.getZoom()) : 12
+        
+        // Create custom icon with boat hull shape (scaled to real-world dimensions)
+        const iconSize = getIconSize(boatType, zoom)
+        const icon = L.divIcon({
+          className: 'boat-marker',
+          html: createBoatIcon(boatType, track.boat.color, iconSize[0], iconSize[1], 0),
+          iconSize: iconSize,
+          iconAnchor: [iconSize[0] / 2, iconSize[1] / 2],
+        })
+        
+        track.marker = L.marker(latlngs[0], { icon }).addTo(mapRef.current!)
+        
+        track.marker.bindTooltip(track.boat.name, {
+          permanent: false,
+          direction: 'top'
+        })
+        
+        markersRef.current.set(track.boat.id, track.marker)
+      }
+    })
+
+    setBoatTracks(newTracks)
+  }, [boatTracks.length, showTracks])
+
+  // Update boat colors and track visibility when they change
+  useEffect(() => {
+    const zoom = zoomRef.current
+    boatTracks.forEach(track => {
+      const marker = markersRef.current.get(track.boat.id)
+      if (marker) {
+        const boatType = track.boat.boat_type || 'FJ'
+        const iconSize = getIconSize(boatType, zoom)
+        const newIcon = L.divIcon({
+          className: 'boat-marker',
+          html: createBoatIcon(boatType, track.boat.color, iconSize[0], iconSize[1], 0),
+          iconSize: iconSize,
+          iconAnchor: [iconSize[0] / 2, iconSize[1] / 2],
+        })
+        marker.setIcon(newIcon)
+      }
+      
+      // Update polyline color and visibility
+      if (track.polyline) {
+        track.polyline.setStyle({ 
+          color: track.boat.color,
+          opacity: showTracks ? 0.5 : 0
+        })
+      }
+    })
+  }, [boatTracks, showTracks])
+
+  // Update icon sizes when zoom changes
+  useEffect(() => {
+    boatTracks.forEach(track => {
+      const marker = markersRef.current.get(track.boat.id)
+      if (marker) {
+        const boatType = track.boat.boat_type || 'FJ'
+        const iconSize = getIconSize(boatType, currentZoom)
+        // Get the current rotation (or default to 0 if not yet set)
+        const rotation = rotationRef.current.get(track.boat.id) || 0
+        const iconHtml = getCachedIcon(boatType, track.boat.color, iconSize[0], iconSize[1], rotation)
+        const newIcon = L.divIcon({
+          className: 'boat-marker',
+          html: iconHtml,
+          iconSize: iconSize,
+          iconAnchor: [iconSize[0] / 2, iconSize[1] / 2],
+        })
+        marker.setIcon(newIcon)
+      }
+    })
+  }, [currentZoom, boatTracks])
+
+  // Playback animation
+  useEffect(() => {
+    if (!isPlaying || !startTime || !endTime) return
+
+    const animate = (timestamp: number) => {
+      if (!lastTimeRef.current) lastTimeRef.current = timestamp
+      
+      const delta = (timestamp - lastTimeRef.current) * playbackSpeed
+      lastTimeRef.current = timestamp
+
+      setCurrentTime(prev => {
+        const newTime = prev + delta
+        if (newTime >= duration) {
+          setIsPlaying(false)
+          return duration
+        }
+        return newTime
+      })
+
+      animationRef.current = requestAnimationFrame(animate)
+    }
+
+    lastTimeRef.current = 0
+    animationRef.current = requestAnimationFrame(animate)
+
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current)
+      }
+    }
+  }, [isPlaying, playbackSpeed, duration, startTime, endTime])
+
+  // Update boat positions based on current time with interpolation
+  useEffect(() => {
+    if (!startTime || boatTracks.length === 0) return
+
+    const currentTimestamp = startTime.getTime() + currentTime
+    const newSpeeds: Record<number, { speed: number; heading: number }> = {}
+
+    const newTracks = boatTracks.map(track => {
+      const marker = markersRef.current.get(track.boat.id)
+      if (!marker) return track
+
+      // Find the two points to interpolate between
+      let prevPoint: TrackPoint | null = null
+      let nextPoint: TrackPoint | null = null
+
+      for (let i = 0; i < track.points.length; i++) {
+        const p = track.points[i]
+        if (!p.time) continue
+
+        const pointTime = p.time.getTime()
+        
+        if (pointTime <= currentTimestamp) {
+          prevPoint = p
+          nextPoint = track.points[i + 1]?.time && track.points[i + 1].time!.getTime() > currentTimestamp 
+            ? track.points[i + 1] 
+            : null
+        } else {
+          break
+        }
+      }
+
+      // Interpolate position between prevPoint and nextPoint
+      let displayPoint: TrackPoint
+      
+      if (prevPoint && nextPoint && prevPoint.time && nextPoint.time) {
+        const prevTime = prevPoint.time.getTime()
+        const nextTime = nextPoint.time.getTime()
+        const t = (currentTimestamp - prevTime) / (nextTime - prevTime)
+        
+        // Linear interpolation for lat/lng
+        const lat = prevPoint.lat + (nextPoint.lat - prevPoint.lat) * t
+        const lng = prevPoint.lng + (nextPoint.lng - prevPoint.lng) * t
+        
+        // Interpolate speed and heading
+        const speed = prevPoint.speed && nextPoint.speed 
+          ? prevPoint.speed + (nextPoint.speed - prevPoint.speed) * t 
+          : prevPoint.speed
+        const heading = prevPoint.heading && nextPoint.heading
+          ? prevPoint.heading + (nextPoint.heading - prevPoint.heading) * t
+          : prevPoint.heading
+        
+        displayPoint = { lat, lng, time: null, speed, heading }
+      } else {
+        displayPoint = prevPoint || track.points[0]
+      }
+
+      // Update marker position
+      marker.setLatLng([displayPoint.lat, displayPoint.lng])
+
+      // Use cached icon with rotation (much faster than creating new icons)
+      // Use zoomRef for the current animation frame to get correct size
+      const boatType = track.boat.boat_type || 'FJ'
+      const zoom = zoomRef.current
+      // Get or create heading smoother for this boat
+      let smoother = headingSmoothers.get(track.boat.id)
+      if (!smoother) {
+        smoother = new HeadingSmoother(2) // 2-point smoothing
+        headingSmoothers.set(track.boat.id, smoother)
+      }
+      
+      // Apply smoothing to the heading
+      const rawHeading = displayPoint.heading || 0
+      const smoothedHeading = smoother.add(rawHeading)
+      const rotation = smoothedHeading
+      rotationRef.current.set(track.boat.id, rotation) // Store for zoom updates
+      const iconSize = getIconSize(boatType, zoom)
+      const iconHtml = getCachedIcon(boatType, track.boat.color, iconSize[0], iconSize[1], rotation)
+      const newIcon = L.divIcon({
+        className: 'boat-marker',
+        html: iconHtml,
+        iconSize: iconSize,
+        iconAnchor: [iconSize[0] / 2, iconSize[1] / 2],
+      })
+      marker.setIcon(newIcon)
+
+      // Update tooltip with speed/heading
+      const speed = displayPoint.speed?.toFixed(1) || '--'
+      const heading = displayPoint.heading?.toFixed(0) || '--'
+      marker.setTooltipContent(`${track.boat.name}<br>${speed} kts<br>${heading}°`)
+
+      // Store current speed for display panel
+      if (displayPoint.speed) {
+        newSpeeds[track.boat.id] = {
+          speed: displayPoint.speed,
+          heading: displayPoint.heading || 0
+        }
+      }
+
+      return { ...track }
+    })
+
+    setBoatTracks(newTracks)
+    setCurrentBoatSpeeds(newSpeeds)
+  }, [currentTime, startTime])
+
+  const togglePlay = () => {
+    if (currentTime >= duration) {
+      setCurrentTime(0)
+      lastTimeRef.current = 0  // Reset timing when restarting
+      // Reset heading smoothers when restarting playback
+      headingSmoothers.forEach(s => s.reset())
+    }
+    setIsPlaying(!isPlaying)
+  }
+
+  const handleTimelineChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setCurrentTime(parseFloat(e.target.value))
+  }
+
+  const formatTime = (ms: number) => {
+    if (!startTime) return '00:00'
+    const date = new Date(startTime.getTime() + ms)
+    return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  }
+
+  // Handle color change - update local state immediately
+  const handleColorChange = (boatId: number, newColor: string) => {
+    // Update local state for immediate visual feedback
+    setBoatTracks(prev => prev.map(bt => 
+      bt.boat.id === boatId 
+        ? { ...bt, boat: { ...bt.boat, color: newColor } }
+        : bt
+    ))
+    
+    // Notify parent to save to backend
+    onBoatUpdate?.(boatId, { color: newColor })
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <div ref={mapContainer} style={{ flex: 1, minHeight: '500px', borderRadius: '8px', overflow: 'hidden' }} />
+      
+      {/* Speed Display Panel */}
+      <div style={{ 
+        display: 'flex', 
+        gap: '16px', 
+        marginTop: '16px',
+        padding: '12px 16px',
+        background: '#f8f9fa',
+        borderRadius: '8px',
+        border: '1px solid #e0e0e0',
+        flexWrap: 'wrap'
+      }}>
+        <div style={{ fontWeight: 500, color: '#666', marginRight: '8px' }}>Current:</div>
+        {boatTracks.map(track => {
+          const speedData = currentBoatSpeeds[track.boat.id]
+          return (
+            <div key={track.boat.id} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span style={{ 
+                width: '10px', 
+                height: '10px', 
+                borderRadius: '50%', 
+                background: track.boat.color 
+              }} />
+              <span style={{ fontSize: '13px', fontWeight: 500 }}>{track.boat.name}:</span>
+              <span style={{ fontSize: '14px', color: '#2e7d32', fontWeight: 600 }}>
+                {speedData ? `${speedData.speed.toFixed(1)} kts` : '-- kts'}
+              </span>
+              <span style={{ fontSize: '12px', color: '#666' }}>
+                @ {speedData ? `${speedData.heading.toFixed(0)}°` : '--'}
+              </span>
+            </div>
+          )
+        })}
+      </div>
+
+      <div style={{ 
+        padding: '16px', 
+        background: 'white', 
+        borderRadius: '8px', 
+        marginTop: '16px',
+        border: '1px solid #e0e0e0'
+      }}>
+        {/* Timeline */}
+        <div style={{ marginBottom: '12px' }}>
+          <input
+            type="range"
+            min={0}
+            max={duration}
+            value={currentTime}
+            onChange={handleTimelineChange}
+            style={{ width: '100%', cursor: 'pointer' }}
+          />
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#666' }}>
+            <span>{formatTime(0)}</span>
+            <span>{formatTime(currentTime)}</span>
+            <span>{formatTime(duration)}</span>
+          </div>
+        </div>
+
+        {/* Controls */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '16px' }}>
+          <button
+            onClick={togglePlay}
+            disabled={duration === 0}
+            style={{
+              padding: '12px 24px',
+              fontSize: '16px',
+              cursor: duration === 0 ? 'not-allowed' : 'pointer',
+              background: isPlaying ? '#ea4335' : '#2e7d32',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              fontWeight: 500,
+              opacity: duration === 0 ? 0.5 : 1
+            }}
+          >
+            {isPlaying ? '⏸ Pause' : '▶ Play'}
+          </button>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '14px', color: '#666' }}>Speed:</span>
+            {[0.5, 1, 2, 4].map(speed => (
+              <button
+                key={speed}
+                onClick={() => setPlaybackSpeed(speed)}
+                style={{
+                  padding: '6px 12px',
+                  fontSize: '13px',
+                  cursor: 'pointer',
+                  background: playbackSpeed === speed ? '#4285f4' : '#f8f9fa',
+                  color: playbackSpeed === speed ? 'white' : '#333',
+                  border: '1px solid #ddd',
+                  borderRadius: '4px'
+                }}
+              >
+                {speed}x
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Boat Legend with Color Pickers */}
+        <div style={{ display: 'flex', gap: '16px', marginTop: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', fontSize: '13px' }}>
+            <input
+              type="checkbox"
+              checked={showTracks}
+              onChange={(e) => setShowTracks(e.target.checked)}
+              style={{ width: '16px', height: '16px', cursor: 'pointer' }}
+            />
+            Show GPS Tracks
+          </label>
+          <div style={{ borderLeft: '1px solid #ddd', paddingLeft: '16px', display: 'flex', gap: '16px', flexWrap: 'wrap' }}>
+          {boats.map(boat => {
+            // Find the current color from boatTracks (may have been updated)
+            const track = boatTracks.find(t => t.boat.id === boat.id)
+            const currentColor = track?.boat.color || boat.color
+            
+            return (
+              <div key={boat.id} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <input
+                  type="color"
+                  value={currentColor}
+                  onChange={(e) => handleColorChange(boat.id, e.target.value)}
+                  style={{ width: '24px', height: '24px', padding: 0, border: 'none', cursor: 'pointer', borderRadius: '4px' }}
+                  title="Change boat color"
+                />
+                <span style={{ fontSize: '13px' }}>{boat.name}</span>
+                {boat.boat_type && (
+                  <span style={{ background: '#e3f2fd', padding: '2px 8px', borderRadius: '10px', fontSize: '11px', color: '#1565c0' }}>
+                    {boat.boat_type}
+                  </span>
+                )}
+              </div>
+            )
+          })}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export default MapReplay
