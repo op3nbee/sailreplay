@@ -55,10 +55,10 @@ const GPS_OFFSET_FROM_BOW: Record<string, number> = {
 
 // Boat dimensions for scaling (in meters)
 // FJ (Flying Junior): 13'3" = 4.04m length, 4'11" = 1.5m beam
-// 420 (Club 420): 13.9' = 4.24m length, 5.5' = 1.68m beam
+// 420 (Club 420): 13.75' = 4.19m length, 5.5' = 1.68m beam
 const BOAT_DIMENSIONS: Record<string, { length: number; beam: number }> = {
   'FJ': { length: 4.04, beam: 1.5 },
-  '420': { length: 4.24, beam: 1.68 },
+  '420': { length: 4.19, beam: 1.68 },
 }
 
 // At higher zoom, each pixel represents less ground distance, so objects appear larger
