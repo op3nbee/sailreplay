@@ -1,7 +1,19 @@
 import { useEffect, useRef, useState } from 'react'
 import L from 'leaflet'
+import 'leaflet-rotate' // Leaflet rotation plugin
 import { gpx as parseGPX } from '@tmcw/togeojson'
 import { DOMParser } from 'xmldom'
+
+// Historical weather data from Open-Meteo API
+interface HistoricalWeather {
+  date: string
+  temperature: number // Celsius
+  windSpeed: number // km/h
+  windDirection: number // degrees
+  windGusts: number // km/h
+  weatherCode: number
+  precipitation: number // mm
+}
 
 // Georgetown-inspired color palette with 18 presets
 const COLOR_PRESETS = [
@@ -32,6 +44,15 @@ interface Boat {
   boat_type?: string
 }
 
+// GPS logger offset from bow (as fraction of boat length)
+// 420: GPS logger is 1/4 (25%) of boat length back from bow (3/4 from bow, 1/4 from stern)
+// FJ: GPS logger is 1/3 (33.3%) of boat length back from bow (2/3 from bow, 1/3 from stern)
+// Since our icons have bow at top, iconAnchor Y should be at this offset from the top
+const GPS_OFFSET_FROM_BOW: Record<string, number> = {
+  '420': 0.25,  // 25% from bow (top of image)
+  'FJ': 0.333,  // 33.3% from bow (top of image)
+}
+
 // Boat dimensions for scaling (in meters)
 // FJ (Flying Junior): 13'3" = 4.04m length, 4'11" = 1.5m beam
 // 420 (Club 420): 13.9' = 4.24m length, 5.5' = 1.68m beam
@@ -48,12 +69,18 @@ function metersToPixels(meters: number, zoom: number): number {
 
 // Create boat hull icon using PNG images with color tinting and rotation
 // Returns HTML for use in L.divIcon
-function createBoatIcon(boatType: string, color: string, pixelWidth: number, pixelHeight: number, rotation: number = 0): string {
+// anchorX, anchorY: the point in the icon that corresponds to the GPS coordinates
+function createBoatIcon(boatType: string, color: string, pixelWidth: number, pixelHeight: number, rotation: number = 0, anchorX?: number, anchorY?: number): string {
   // PNG file path (served from public folder)
   const imageFile = boatType === '420' ? '/420-model.png' : '/fj-model.png'
   
   // The PNG images are oriented correctly, no rotation adjustment needed
   const adjustedRotation = rotation
+  
+  // Transform origin should be the anchor point (GPS location) so the boat rotates around that point
+  // If anchor not provided, default to center
+  const originX = anchorX !== undefined ? `${anchorX}px` : 'center'
+  const originY = anchorY !== undefined ? `${anchorY}px` : 'center'
   
   // Use CSS mask to apply color to black silhouette:
   // The image is used as a mask (only opaque parts show)
@@ -63,7 +90,7 @@ function createBoatIcon(boatType: string, color: string, pixelWidth: number, pix
       width: ${pixelWidth}px; 
       height: ${pixelHeight}px; 
       transform: rotate(${adjustedRotation}deg);
-      transform-origin: center center;
+      transform-origin: ${originX} ${originY};
       -webkit-mask-image: url('${imageFile}');
       -webkit-mask-size: contain;
       -webkit-mask-repeat: no-repeat;
@@ -84,11 +111,11 @@ function createBoatIcon(boatType: string, color: string, pixelWidth: number, pix
 
 // Icon cache to avoid recreating icons every frame
 const iconCache = new Map<string, string>()
-function getCachedIcon(boatType: string, color: string, pixelWidth: number, pixelHeight: number, rotation: number): string {
-  // Create a unique key based on boat type, color, size, and rotation (rounded to 5 degrees)
-  const key = `${boatType}-${color}-${Math.round(pixelWidth)}-${Math.round(pixelHeight)}-${Math.round(rotation / 5) * 5}`
+function getCachedIcon(boatType: string, color: string, pixelWidth: number, pixelHeight: number, rotation: number, anchorX: number, anchorY: number): string {
+  // Create a unique key based on boat type, color, size, rotation, and anchor (rounded to 5 degrees)
+  const key = `${boatType}-${color}-${Math.round(pixelWidth)}-${Math.round(pixelHeight)}-${Math.round(rotation / 5) * 5}-${Math.round(anchorX)}-${Math.round(anchorY)}`
   if (!iconCache.has(key)) {
-    iconCache.set(key, createBoatIcon(boatType, color, pixelWidth, pixelHeight, rotation))
+    iconCache.set(key, createBoatIcon(boatType, color, pixelWidth, pixelHeight, rotation, anchorX, anchorY))
   }
   return iconCache.get(key)!
 }
@@ -103,6 +130,26 @@ function getIconSize(boatType: string, zoom: number): [number, number] {
   
   // Return [width, height] - PNG images are vertical (height > width)
   return [Math.round(pixelBeam), Math.round(pixelLength)]
+}
+
+// Get icon anchor point based on GPS logger offset
+// This positions the GPS location at the correct point on the boat icon
+// The anchor is the point in the icon that corresponds to the GPS coordinates on the map
+// The CSS rotation will rotate around this anchor point
+function getIconAnchor(boatType: string, iconSize: [number, number]): [number, number] {
+  // GPS offset from bow as fraction of boat length (measured from bow toward stern)
+  // 420: GPS at 1/4 (25%) from bow = 75% down from bow (top of image)
+  // FJ: GPS at 1/3 (33.3%) from bow = 66.7% down from bow (top of image)
+  const offsetFromBow = GPS_OFFSET_FROM_BOW[boatType] || GPS_OFFSET_FROM_BOW['FJ']
+  
+  // The GPS point is at this fraction down from the top (bow) of the image
+  // In image coordinates: Y increases downward
+  const gpsY = iconSize[1] * offsetFromBow
+  const gpsX = iconSize[0] / 2  // Centered horizontally
+  
+  // The anchor is simply the GPS position in the icon
+  // CSS rotation will rotate around this point
+  return [gpsX, gpsY]
 }
 
 interface TrackPoint {
@@ -141,6 +188,51 @@ interface MapReplayProps {
 }
 
 function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
+  // Fetch historical weather from Open-Meteo API
+  const fetchHistoricalWeather = async (lat: number, lng: number, date: Date) => {
+    try {
+      setWeatherLoading(true)
+      setWeatherError(null)
+      
+      const dateStr = date.toISOString().split('T')[0] // YYYY-MM-DD
+      
+      const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lng}&start_date=${dateStr}&end_date=${dateStr}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation,weather_code`
+      
+      const response = await fetch(url)
+      if (!response.ok) {
+        throw new Error(`Weather API error: ${response.status}`)
+      }
+      
+      const data = await response.json()
+      
+      if (data.hourly && data.hourly.time && data.hourly.time.length > 0) {
+        // Get midday values (or first available)
+        const middayIndex = Math.floor(data.hourly.time.length / 2)
+        
+        const weather: HistoricalWeather = {
+          date: dateStr,
+          temperature: data.hourly.temperature_2m?.[middayIndex] ?? 0,
+          windSpeed: data.hourly.wind_speed_10m?.[middayIndex] ?? 0,
+          windDirection: data.hourly.wind_direction_10m?.[middayIndex] ?? 0,
+          windGusts: data.hourly.wind_gusts_10m?.[middayIndex] ?? 0,
+          weatherCode: data.hourly.weather_code?.[middayIndex] ?? 0,
+          precipitation: data.hourly.precipitation?.[middayIndex] ?? 0,
+        }
+        
+        setHistoricalWeather(weather)
+        return weather
+      }
+      
+      throw new Error('No weather data available')
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : 'Failed to fetch weather'
+      setWeatherError(errorMsg)
+      console.error('Weather fetch error:', err)
+      return null
+    } finally {
+      setWeatherLoading(false)
+    }
+  }
   const mapContainer = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const [boatTracks, setBoatTracks] = useState<BoatTrack[]>([])
@@ -160,13 +252,12 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
   const rotationRef = useRef<Map<number, number>>(new Map()) // Track current rotation per boat
   const [currentZoom, setCurrentZoom] = useState(12)
   const [showTracks, setShowTracks] = useState(true)
+  // Boat labels shown on hover (not via toggle checkbox)
   
   // Marks state
   const [marks, setMarks] = useState<Mark[]>([])
-  const [markMode, setMarkMode] = useState<'none' | 'course' | 'start' | 'finish' | 'edit'>('none')
-  const [startLinePoints, setStartLinePoints] = useState<[number, number][]>([])
+  const [markMode, setMarkMode] = useState<'none' | 'course' | 'start' | 'finish' | 'move' | 'delete'>('none')
   const marksLayerRef = useRef<L.LayerGroup | null>(null)
-  const startLineRef = useRef<L.Polyline | null>(null)
   const markMarkersRef = useRef<Map<string, L.Marker>>(new Map())
   
   // Use ref to track markMode for click handler (avoids re-registering handler)
@@ -179,10 +270,12 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
   const [colorPickerPosition, setColorPickerPosition] = useState<{ x: number; y: number } | null>(null)
   
   // Map rotation state
-  const [mapRotation, setMapRotation] = useState(0)
-  
-  // Weather state
-  const [weather, setWeather] = useState<{ direction: number; speed: number; gust: number } | null>(null)
+  const [mapBearing, setMapBearing] = useState(0)
+
+  // Historical weather state
+  const [historicalWeather, setHistoricalWeather] = useState<HistoricalWeather | null>(null)
+  const [weatherLoading, setWeatherLoading] = useState(false)
+  const [weatherError, setWeatherError] = useState<string | null>(null)
 
   // Keep boats ref updated
   useEffect(() => {
@@ -193,13 +286,18 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
   useEffect(() => {
     if (!mapContainer.current || mapRef.current) return
 
-    mapRef.current = L.map(mapContainer.current, {
+    // Type assertion to include leaflet-rotate options
+    const mapOptions = {
       center: [38.9, -77.0], // Default to DC area
       zoom: 12,
       minZoom: 10,
       maxZoom: 22,
-      zoomControl: true
-    })
+      zoomControl: true,
+      rotate: true, // Enable leaflet-rotate plugin
+      bearing: 0
+    } as L.MapOptions
+
+    mapRef.current = L.map(mapContainer.current, mapOptions)
 
     // Base layer - CartoDB Voyager (clean, reliable)
     L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
@@ -221,16 +319,22 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
         setCurrentZoom(zoom)
       }
     })
+    
+    // Check if leaflet-rotate plugin extended L.Map (debug logging)
+    setTimeout(() => {
+      const hasRotation = typeof (mapRef.current as any).setBearing === 'function'
+      console.log('Leaflet rotation plugin:', hasRotation ? 'loaded' : 'NOT loaded')
+    }, 500)
 
     // Initialize marks layer
     marksLayerRef.current = L.layerGroup().addTo(mapRef.current)
 
-    // Handle clicks for adding marks (only when not in edit mode and when mark mode is active)
+    // Handle clicks for adding marks (only when not in move/delete mode and when mark mode is active)
     mapRef.current.on('click', (e: L.LeafletMouseEvent) => {
       const currentMarkMode = markModeRef.current
       
-      // Don't add marks in edit mode - that mode is for dragging
-      if (currentMarkMode === 'edit') return
+      // Don't add marks in move or delete mode
+      if (currentMarkMode === 'move' || currentMarkMode === 'delete') return
       
       const { lat, lng } = e.latlng
       
@@ -244,31 +348,32 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
           label: `M${marks.filter(m => m.type === 'course').length + 1}`
         }
         setMarks(prev => [...prev, newMark])
-      } else if (currentMarkMode === 'start' || currentMarkMode === 'finish') {
-        // Add point to start/finish line (need 2 points)
-        setStartLinePoints(prev => {
-          const newPoints = [...prev, [lat, lng] as [number, number]]
-          if (newPoints.length === 2) {
-            // Both points collected - create marks and line
-            const mark1: Mark = {
-              id: `start-${Date.now()}-1`,
-              lat: newPoints[0][0],
-              lng: newPoints[0][1],
-              type: 'start',
-              label: 'Start'
-            }
-            const mark2: Mark = {
-              id: `finish-${Date.now()}-2`,
-              lat: newPoints[1][0],
-              lng: newPoints[1][1],
-              type: 'finish',
-              label: 'Finish'
-            }
-            setMarks(prev => [...prev, mark1, mark2])
-            return [] // Reset for next line
-          }
-          return newPoints
-        })
+      } else if (currentMarkMode === 'start') {
+        // Add a start mark (can have up to 2)
+        const existingStarts = marks.filter(m => m.type === 'start').length
+        if (existingStarts >= 2) return // Max 2 start marks
+        
+        const newMark: Mark = {
+          id: `start-${Date.now()}`,
+          lat,
+          lng,
+          type: 'start',
+          label: `Start ${existingStarts + 1}`
+        }
+        setMarks(prev => [...prev, newMark])
+      } else if (currentMarkMode === 'finish') {
+        // Add a finish mark (can have up to 2)
+        const existingFinishes = marks.filter(m => m.type === 'finish').length
+        if (existingFinishes >= 2) return // Max 2 finish marks
+        
+        const newMark: Mark = {
+          id: `finish-${Date.now()}`,
+          lat,
+          lng,
+          type: 'finish',
+          label: `Finish ${existingFinishes + 1}`
+        }
+        setMarks(prev => [...prev, newMark])
       }
     })
 
@@ -412,6 +517,14 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
         if (allPoints.length > 0) {
           const bounds = L.latLngBounds(allPoints)
           mapRef.current.fitBounds(bounds, { padding: [50, 50] })
+          
+          // Fetch historical weather for the center of the track on the date of the first point
+          const center = bounds.getCenter()
+          const firstTrack = tracks[0]
+          const firstPointWithTime = firstTrack?.points.find(p => p.time)
+          if (firstPointWithTime?.time) {
+            fetchHistoricalWeather(center.lat, center.lng, firstPointWithTime.time)
+          }
         }
       }
     }
@@ -452,20 +565,35 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
         const boatType = track.boat.boat_type || 'FJ'
         const zoom = mapRef.current ? Math.round(mapRef.current.getZoom()) : 12
         
+        // Get initial heading from first point with heading data, or default to 0
+        const firstPointWithHeading = track.points.find(p => p.heading !== undefined)
+        const initialHeading = firstPointWithHeading?.heading ?? 0
+        
         // Create custom icon with boat hull shape (scaled to real-world dimensions)
         const iconSize = getIconSize(boatType, zoom)
+        const iconAnchor = getIconAnchor(boatType, iconSize)
         const icon = L.divIcon({
           className: 'boat-marker',
-          html: createBoatIcon(boatType, track.boat.color, iconSize[0], iconSize[1], 0),
+          html: createBoatIcon(boatType, track.boat.color, iconSize[0], iconSize[1], initialHeading, iconAnchor[0], iconAnchor[1]),
           iconSize: iconSize,
-          iconAnchor: [iconSize[0] / 2, iconSize[1] / 2],
+          iconAnchor: iconAnchor,
         })
         
         track.marker = L.marker(latlngs[0], { icon }).addTo(mapRef.current!)
         
+        // Add label tooltip on hover
         track.marker.bindTooltip(track.boat.name, {
           permanent: false,
-          direction: 'top'
+          direction: 'top',
+          opacity: 1
+        })
+        
+        // Show tooltip on mouseover
+        track.marker.on('mouseover', function(this: L.Marker) {
+          this.openTooltip()
+        })
+        track.marker.on('mouseout', function(this: L.Marker) {
+          this.closeTooltip()
         })
         
         markersRef.current.set(track.boat.id, track.marker)
@@ -499,14 +627,17 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
       if (marker) {
         const boatType = track.boat.boat_type || 'FJ'
         const zoom = zoomRef.current
-        const iconSize = getIconSize(boatType, zoom)
         // Preserve current rotation instead of resetting to 0
         const currentRotation = rotationRef.current.get(track.boat.id) || 0
+        // Add map bearing to boat rotation so boats rotate with the map
+        const totalRotation = (currentRotation + mapBearing) % 360
+        const iconSize = getIconSize(boatType, zoom)
+        const iconAnchor = getIconAnchor(boatType, iconSize)
         const newIcon = L.divIcon({
           className: 'boat-marker',
-          html: createBoatIcon(boatType, track.boat.color, iconSize[0], iconSize[1], currentRotation),
+          html: createBoatIcon(boatType, track.boat.color, iconSize[0], iconSize[1], totalRotation, iconAnchor[0], iconAnchor[1]),
           iconSize: iconSize,
-          iconAnchor: [iconSize[0] / 2, iconSize[1] / 2],
+          iconAnchor: iconAnchor,
         })
         marker.setIcon(newIcon)
       }
@@ -527,26 +658,31 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
     })
   }, [boatTracks, showTracks])
 
+  // Boat labels are shown on hover (handled in marker creation)
+
   // Update icon sizes when zoom changes
   useEffect(() => {
     boatTracks.forEach(track => {
       const marker = markersRef.current.get(track.boat.id)
       if (marker) {
         const boatType = track.boat.boat_type || 'FJ'
-        const iconSize = getIconSize(boatType, currentZoom)
         // Get the current rotation (or default to 0 if not yet set)
         const rotation = rotationRef.current.get(track.boat.id) || 0
-        const iconHtml = getCachedIcon(boatType, track.boat.color, iconSize[0], iconSize[1], rotation)
+        // Add map bearing to boat rotation so boats rotate with the map
+        const totalRotation = (rotation + mapBearing) % 360
+        const iconSize = getIconSize(boatType, currentZoom)
+        const iconAnchor = getIconAnchor(boatType, iconSize)
+        const iconHtml = getCachedIcon(boatType, track.boat.color, iconSize[0], iconSize[1], totalRotation, iconAnchor[0], iconAnchor[1])
         const newIcon = L.divIcon({
           className: 'boat-marker',
           html: iconHtml,
           iconSize: iconSize,
-          iconAnchor: [iconSize[0] / 2, iconSize[1] / 2],
+          iconAnchor: iconAnchor,
         })
         marker.setIcon(newIcon)
       }
     })
-  }, [currentZoom, boatTracks])
+  }, [currentZoom, boatTracks, mapBearing])
 
   // Render marks on map
   useEffect(() => {
@@ -557,24 +693,27 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
     markMarkersRef.current.clear()
     
     // Add each mark to the layer
+    // Mark size: 10px (1/2 instead of 1/3)
+    const markSize = 10
     marks.forEach(mark => {
       let color: string
       let icon: L.DivIcon
+      const half = markSize / 2
       
       if (mark.type === 'course') {
         color = '#ff6d01' // Orange for course marks
         icon = L.divIcon({
           className: 'mark-icon',
           html: `<div style="
-            width: 20px; 
-            height: 20px; 
+            width: ${markSize}px; 
+            height: ${markSize}px; 
             background: ${color}; 
-            border: 2px solid white;
+            border: 1px solid white;
             border-radius: 50%;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            box-shadow: 0 1px 2px rgba(0,0,0,0.3);
           "></div>`,
-          iconSize: [20, 20],
-          iconAnchor: [10, 10],
+          iconSize: [markSize, markSize],
+          iconAnchor: [half, half],
         })
       } else if (mark.type === 'start') {
         color = '#34a853' // Green for start
@@ -583,117 +722,102 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
           html: `<div style="
             width: 0; 
             height: 0; 
-            border-left: 10px solid transparent;
-            border-right: 10px solid transparent;
-            border-bottom: 20px solid ${color};
+            border-left: ${half}px solid transparent;
+            border-right: ${half}px solid transparent;
+            border-bottom: ${markSize}px solid ${color};
           "></div>`,
-          iconSize: [20, 20],
-          iconAnchor: [10, 10],
+          iconSize: [markSize, markSize],
+          iconAnchor: [half, half],
         })
       } else {
         color = '#ea4335' // Red for finish
         icon = L.divIcon({
           className: 'mark-icon',
           html: `<div style="
-            width: 20px; 
-            height: 20px; 
+            width: ${markSize}px; 
+            height: ${markSize}px; 
             background: ${color}; 
-            border: 2px solid white;
-            border-radius: 2px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            border: 1px solid white;
+            border-radius: 1px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.3);
           "></div>`,
-          iconSize: [20, 20],
-          iconAnchor: [10, 10],
+          iconSize: [markSize, markSize],
+          iconAnchor: [half, half],
         })
       }
       
       const marker = L.marker([mark.lat, mark.lng], { 
         icon,
-        draggable: markMode === 'edit' // Only draggable in edit mode
+        draggable: markMode === 'move' // Only draggable in move mode
       })
-      marker.bindTooltip(mark.label || mark.type, { permanent: true, direction: 'top' })
       marker.addTo(marksLayerRef.current!)
       
       // Store marker reference
       markMarkersRef.current.set(mark.id, marker)
       
-      // Handle drag events in edit mode
-      if (markMode === 'edit') {
+      // Handle drag events in move mode
+      if (markMode === 'move') {
         marker.on('dragend', (e: L.LeafletEvent) => {
           const newLatLng = (e.target as L.Marker).getLatLng()
           setMarks(prev => prev.map(m => 
             m.id === mark.id ? { ...m, lat: newLatLng.lat, lng: newLatLng.lng } : m
           ))
         })
-        
-        // Add visual indicator that mark is draggable
-        marker.bindTooltip(`${mark.label || mark.type} (drag to move)`, { 
-          permanent: true, 
-          direction: 'top',
-          className: 'draggable-tooltip'
-        })
       }
       
-      // Make marker right-clickable to delete (only when not in edit mode)
-      if (markMode !== 'edit') {
-        marker.on('contextmenu', () => {
+      // Handle click to delete in delete mode
+      if (markMode === 'delete') {
+        marker.on('click', () => {
           setMarks(prev => prev.filter(m => m.id !== mark.id))
         })
       }
     })
     
-    // Draw start/finish line if we have both types
+    // Draw lines between start marks (if 2+), and between finish marks (if 2+)
     const startMarks = marks.filter(m => m.type === 'start')
     const finishMarks = marks.filter(m => m.type === 'finish')
     
-    if (startMarks.length > 0 && finishMarks.length > 0) {
-      // Draw line between first start and first finish
+    // Draw line between start mark 1 and start mark 2 (if both exist)
+    if (startMarks.length > 1) {
       const line = L.polyline(
         [
           [startMarks[0].lat, startMarks[0].lng],
-          [finishMarks[0].lat, finishMarks[0].lng]
+          [startMarks[1].lat, startMarks[1].lng]
         ],
         {
-          color: '#041E42',
-          weight: 3,
-          dashArray: '10, 5',
+          color: '#34a853', // Green for start line
+          weight: 2,
+          dashArray: '5, 5',
           opacity: 0.8
         }
       )
       line.addTo(marksLayerRef.current!)
     }
-  }, [marks])
-
-  // Show/hide start line preview while clicking
-  useEffect(() => {
-    if (!mapRef.current || !marksLayerRef.current) return
     
-    // Remove existing preview
-    if (startLineRef.current) {
-      startLineRef.current.remove()
-      startLineRef.current = null
-    }
-    
-    if (startLinePoints.length > 0 && (markMode === 'start' || markMode === 'finish')) {
-      startLineRef.current = L.polyline(
-        startLinePoints.map(p => [p[0], p[1]] as L.LatLngTuple),
+    // Draw line between finish mark 1 and finish mark 2 (if both exist)
+    if (finishMarks.length > 1) {
+      const line2 = L.polyline(
+        [
+          [finishMarks[0].lat, finishMarks[0].lng],
+          [finishMarks[1].lat, finishMarks[1].lng]
+        ],
         {
-          color: '#041E42',
-          weight: 3,
+          color: '#ea4335', // Red for finish line
+          weight: 2,
           dashArray: '5, 5',
-          opacity: 0.5
+          opacity: 0.8
         }
       )
-      startLineRef.current.addTo(mapRef.current)
+      line2.addTo(marksLayerRef.current!)
     }
-  }, [startLinePoints, markMode])
+  }, [marks, markMode])
 
   // Control map dragging based on mark mode
   useEffect(() => {
     if (!mapRef.current) return
     
-    // Disable dragging when in any mark mode (except 'none' and 'edit' - edit allows dragging marks)
-    if (markMode === 'course' || markMode === 'start' || markMode === 'finish') {
+    // Disable dragging when placing marks, moving marks, or deleting marks
+    if (markMode === 'course' || markMode === 'start' || markMode === 'finish' || markMode === 'move' || markMode === 'delete') {
       mapRef.current.dragging.disable()
       mapRef.current.scrollWheelZoom.disable()
       mapRef.current.doubleClickZoom.disable()
@@ -703,44 +827,6 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
       mapRef.current.doubleClickZoom.enable()
     }
   }, [markMode])
-
-  // Apply map rotation via CSS transform
-  useEffect(() => {
-    const mapContainer = document.querySelector('.leaflet-container') as HTMLElement
-    if (mapContainer) {
-      mapContainer.style.transform = `rotate(${mapRotation}deg)`
-    }
-  }, [mapRotation])
-
-  // Fetch weather from DCA
-  useEffect(() => {
-    const fetchWeather = async () => {
-      try {
-        // Fetch from NOAA DCA station
-        const response = await fetch('https://api.weather.gov/stations/KDCA/observations/latest')
-        const data = await response.json()
-        
-        if (data.properties) {
-          const windDir = data.properties.windDirection?.value || 0
-          const windSpeed = data.properties.windSpeed?.value || 0
-          const windGust = data.properties.windGust?.value || 0
-          
-          setWeather({
-            direction: windDir,
-            speed: windSpeed * 1.94384, // Convert m/s to knots
-            gust: windGust * 1.94384
-          })
-        }
-      } catch (err) {
-        console.error('Failed to fetch weather:', err)
-      }
-    }
-    
-    fetchWeather()
-    // Refresh every 5 minutes
-    const interval = setInterval(fetchWeather, 5 * 60 * 1000)
-    return () => clearInterval(interval)
-  }, [])
 
   // Playback animation
   useEffect(() => {
@@ -843,13 +929,16 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
       // Use interpolated heading for smooth rotation
       const rotation = displayPoint.heading || 0
       rotationRef.current.set(track.boat.id, rotation) // Store for zoom updates
+      // Add map bearing to boat rotation so boats rotate with the map
+      const totalRotation = (rotation + mapBearing) % 360
       const iconSize = getIconSize(boatType, zoom)
-      const iconHtml = getCachedIcon(boatType, track.boat.color, iconSize[0], iconSize[1], rotation)
+      const iconAnchor = getIconAnchor(boatType, iconSize)
+      const iconHtml = getCachedIcon(boatType, track.boat.color, iconSize[0], iconSize[1], totalRotation, iconAnchor[0], iconAnchor[1])
       const newIcon = L.divIcon({
         className: 'boat-marker',
         html: iconHtml,
         iconSize: iconSize,
-        iconAnchor: [iconSize[0] / 2, iconSize[1] / 2],
+        iconAnchor: iconAnchor,
       })
       marker.setIcon(newIcon)
 
@@ -871,7 +960,7 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
 
     setBoatTracks(newTracks)
     setCurrentBoatSpeeds(newSpeeds)
-  }, [currentTime, startTime])
+  }, [currentTime, startTime, mapBearing])
 
   const togglePlay = () => {
     if (currentTime >= duration) {
@@ -905,9 +994,66 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '600px' }}>
       <div style={{ flex: 1, minHeight: '500px', borderRadius: '8px', overflow: 'hidden', position: 'relative' }}>
         <div ref={mapContainer} style={{ width: '100%', height: '100%' }} />
+        
+        {/* Historical Weather Display - Top Right */}
+        <div style={{
+          position: 'absolute',
+          top: '10px',
+          right: '10px',
+          zIndex: 1000,
+          background: 'white',
+          padding: '10px 14px',
+          borderRadius: '8px',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+          minWidth: '120px'
+        }}>
+          {weatherLoading ? (
+            <div style={{ fontSize: '12px', color: '#666' }}>Loading...</div>
+          ) : weatherError ? (
+            <div style={{ fontSize: '11px', color: '#ea4335' }}>Unavailable</div>
+          ) : historicalWeather ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              {/* Simple arrow pointing where wind is blowing TO */}
+              <div style={{
+                width: '32px',
+                height: '32px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center'
+              }}>
+                <div style={{
+                  fontSize: '24px',
+                  color: '#041E42',
+                  transform: `rotate(${historicalWeather.windDirection + 180}deg)`,
+                  lineHeight: 1
+                }}>
+                  ↑
+                </div>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                <div style={{ fontSize: '11px', color: '#666' }}>
+                  {historicalWeather.date}
+                </div>
+                <div style={{ fontSize: '14px', color: '#333' }}>
+                  {((historicalWeather.temperature * 9/5) + 32).toFixed(1)}°F
+                </div>
+                <div style={{ fontSize: '14px', color: '#333', fontWeight: 600 }}>
+                  {historicalWeather.windSpeed.toFixed(1)} km/h
+                </div>
+                {historicalWeather.windGusts > 0 && (
+                  <div style={{ fontSize: '11px', color: '#666' }}>
+                    gusts {historicalWeather.windGusts.toFixed(1)} km/h
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div style={{ fontSize: '11px', color: '#666' }}>No weather</div>
+          )}
+        </div>
         
         {/* Map Rotation Control - Top Left */}
         <div style={{
@@ -915,95 +1061,83 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
           top: '10px',
           left: '10px',
           zIndex: 1000,
+          background: 'white',
+          padding: '8px 12px',
+          borderRadius: '8px',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
           display: 'flex',
           flexDirection: 'column',
-          gap: '4px',
-          background: 'white',
-          padding: '8px',
-          borderRadius: '8px',
-          boxShadow: '0 2px 8px rgba(0,0,0,0.15)'
+          gap: '4px'
         }}>
-          <button
-            onClick={() => setMapRotation(prev => prev + 45)}
-            style={{
-              width: '32px',
-              height: '32px',
-              cursor: 'pointer',
-              background: '#f8f9fa',
-              border: '1px solid #ddd',
-              borderRadius: '4px',
-              fontSize: '16px'
-            }}
-            title="Rotate map 45° clockwise"
-          >
-            ↻
-          </button>
-          <button
-            onClick={() => setMapRotation(0)}
-            style={{
-              width: '32px',
-              height: '32px',
-              cursor: 'pointer',
-              background: '#f8f9fa',
-              border: '1px solid #ddd',
-              borderRadius: '4px',
-              fontSize: '12px'
-            }}
-            title="Reset rotation"
-          >
-            ⟲
-          </button>
-          <div style={{
-            textAlign: 'center',
-            fontSize: '10px',
-            color: '#666',
-            padding: '2px'
-          }}>
-            {mapRotation}°
+          <div style={{ fontSize: '11px', color: '#666', fontWeight: 500 }}>Map Rotation</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <input
+              type="range"
+              min={0}
+              max={360}
+              value={mapBearing}
+              onChange={(e) => {
+                const bearing = parseInt(e.target.value)
+                setMapBearing(bearing)
+                if (mapRef.current && (mapRef.current as any).setBearing) {
+                  (mapRef.current as any).setBearing(bearing)
+                }
+              }}
+              style={{ width: '100px', cursor: 'pointer' }}
+            />
+            <span style={{ fontSize: '12px', fontWeight: 500, minWidth: '35px' }}>{mapBearing}°</span>
+          </div>
+          <div style={{ display: 'flex', gap: '4px' }}>
+            <button
+              onClick={() => {
+                setMapBearing(0)
+                if (mapRef.current && (mapRef.current as any).setBearing) {
+                  (mapRef.current as any).setBearing(0)
+                }
+              }}
+              style={{
+                padding: '2px 8px',
+                fontSize: '10px',
+                cursor: 'pointer',
+                background: '#f8f9fa',
+                border: '1px solid #ddd',
+                borderRadius: '4px'
+              }}
+            >
+              Reset
+            </button>
+            {historicalWeather && (
+              <button
+                onClick={() => {
+                  // Rotate map so wind blows DOWN the screen (from top to bottom)
+                  // Wind direction = where wind is FROM
+                  // Wind blows TO (windDirection + 180) mod 360
+                  // We want "TO" direction to point down (south on screen)
+                  // So: (windDirection + 180 - mapBearing) mod 360 = 180 (south)
+                  // mapBearing = windDirection
+                  // Actually simpler: rotate so north points to (windDirection - 90)
+                  const windBearing = (270 - historicalWeather.windDirection + 360) % 360
+                  setMapBearing(windBearing)
+                  if (mapRef.current && (mapRef.current as any).setBearing) {
+                    (mapRef.current as any).setBearing(windBearing)
+                  }
+                }}
+                style={{
+                  padding: '2px 8px',
+                  fontSize: '10px',
+                  cursor: 'pointer',
+                  background: '#e3f2fd',
+                  border: '1px solid #1a73e8',
+                  borderRadius: '4px',
+                  color: '#1a73e8'
+                }}
+                title={`Align map with wind (${historicalWeather.windDirection}°)`}
+              >
+                ↓ Wind
+              </button>
+            )}
           </div>
         </div>
-        
-        {/* Weather Display - Top Right */}
-        {weather && (
-          <div style={{
-            position: 'absolute',
-            top: '10px',
-            right: '10px',
-            zIndex: 1000,
-            background: 'white',
-            padding: '12px 16px',
-            borderRadius: '8px',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            gap: '4px'
-          }}>
-            <div style={{ fontSize: '11px', color: '#666', fontWeight: 500 }}>DCA Weather</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <div style={{ 
-                fontSize: '24px', 
-                transform: `rotate(${weather.direction}deg)`,
-                transition: 'transform 0.5s ease'
-              }}>
-                ➤
-              </div>
-              <div>
-                <div style={{ fontSize: '18px', fontWeight: 600, color: '#041E42' }}>
-                  {weather.speed.toFixed(1)} kts
-                </div>
-                {weather.gust > 0 && (
-                  <div style={{ fontSize: '11px', color: '#666' }}>
-                    gusts {weather.gust.toFixed(1)}
-                  </div>
-                )}
-              </div>
-            </div>
-            <div style={{ fontSize: '10px', color: '#999' }}>
-              {weather.direction.toFixed(0)}° from N
-            </div>
-          </div>
-        )}
       </div>
       
       {/* Speed Display Panel */}
@@ -1137,7 +1271,7 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
               ⬤ Course
             </button>
             <button
-              onClick={() => { setMarkMode(markMode === 'start' ? 'none' : 'start'); setStartLinePoints([]) }}
+              onClick={() => setMarkMode(markMode === 'start' ? 'none' : 'start')}
               style={{
                 padding: '6px 12px',
                 fontSize: '12px',
@@ -1152,7 +1286,7 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
               ▲ Start
             </button>
             <button
-              onClick={() => { setMarkMode(markMode === 'finish' ? 'none' : 'finish'); setStartLinePoints([]) }}
+              onClick={() => setMarkMode(markMode === 'finish' ? 'none' : 'finish')}
               style={{
                 padding: '6px 12px',
                 fontSize: '12px',
@@ -1167,19 +1301,34 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
               ■ Finish
             </button>
             <button
-              onClick={() => setMarkMode(markMode === 'edit' ? 'none' : 'edit')}
+              onClick={() => setMarkMode(markMode === 'move' ? 'none' : 'move')}
               style={{
                 padding: '6px 12px',
                 fontSize: '12px',
                 cursor: 'pointer',
-                background: markMode === 'edit' ? '#9334e6' : '#f8f9fa',
-                color: markMode === 'edit' ? 'white' : '#333',
+                background: markMode === 'move' ? '#9334e6' : '#f8f9fa',
+                color: markMode === 'move' ? 'white' : '#333',
                 border: '1px solid #ddd',
                 borderRadius: '4px'
               }}
-              title="Edit mode: drag marks to move, drag to trash to delete"
+              title="Move mode: drag marks to reposition"
             >
-              ✎ Edit
+              ↔ Move
+            </button>
+            <button
+              onClick={() => setMarkMode(markMode === 'delete' ? 'none' : 'delete')}
+              style={{
+                padding: '6px 12px',
+                fontSize: '12px',
+                cursor: 'pointer',
+                background: markMode === 'delete' ? '#ea4335' : '#f8f9fa',
+                color: markMode === 'delete' ? 'white' : '#333',
+                border: '1px solid #ddd',
+                borderRadius: '4px'
+              }}
+              title="Delete mode: click marks to remove them"
+            >
+              ✕ Delete
             </button>
             {marks.length > 0 && (
               <button
@@ -1199,37 +1348,17 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
             )}
           </div>
           
-          {/* Trash Bin - only show in edit mode */}
-          {markMode === 'edit' && (
-            <div 
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => {
-                e.preventDefault()
-                const markId = e.dataTransfer.getData('markId')
-                if (markId) {
-                  setMarks(prev => prev.filter(m => m.id !== markId))
-                }
-              }}
-              style={{
-                padding: '8px 12px',
-                background: '#ffebee',
-                border: '2px dashed #ef5350',
-                borderRadius: '8px',
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '6px',
-                fontSize: '12px',
-                color: '#c62828'
-              }}
-              title="Drag marks here to delete"
-            >
-              🗑️ Drop to Delete
-            </div>
-          )}
-          
-          {/* Boat colors - clickable to open popup */}
-          <div style={{ borderLeft: '1px solid #ddd', paddingLeft: '16px', display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+          {/* Boat colors - clickable to open popup - scrollable if many boats */}
+          <div style={{ 
+            borderLeft: '1px solid #ddd', 
+            paddingLeft: '16px', 
+            display: 'flex', 
+            gap: '12px', 
+            flexWrap: 'wrap',
+            maxHeight: '120px',
+            overflowY: 'auto',
+            alignItems: 'center'
+          }}>
             {boats.map(boat => {
               const track = boatTracks.find(t => t.boat.id === boat.id)
               const currentColor = track?.boat.color || boat.color
@@ -1239,7 +1368,8 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
                   key={boat.id} 
                   onClick={(e) => {
                     const rect = (e.target as HTMLElement).getBoundingClientRect()
-                    setColorPickerPosition({ x: rect.left, y: rect.bottom + 8 })
+                    // Open color picker upward (subtract popup height ~200px from top)
+                    setColorPickerPosition({ x: rect.left, y: rect.top - 200 })
                     setSelectedBoatForColor(boat.id)
                     setShowColorPicker(true)
                   }}

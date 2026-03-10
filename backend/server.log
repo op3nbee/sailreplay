@@ -1,22 +1,52 @@
-INFO:     Started server process [88033]
+INFO:     Started server process [90284]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     127.0.0.1:57283 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57282 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57294 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57293 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57300 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57301 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57311 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57312 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57327 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57326 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57334 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57332 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57341 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57340 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57346 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57348 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57492 - "GET /api/practices HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57493 - "GET /api/practices HTTP/1.1" 200 OK
+ERROR:    [Errno 48] error while attempting to bind on address ('0.0.0.0INFO:     127.0.0.1:57729 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57734 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57736 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57740 - "GET /api/practices/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57743 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57746 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57749 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57752 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57825 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57827 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57838 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57836 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57849 - "GET /api/practices/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57851 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57853 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57855 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57858 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60155 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60157 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60176 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60177 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60179 - "GET /api/practices/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60181 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60183 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60185 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60188 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60226 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60227 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60230 - "GET /api/practices/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60232 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60234 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60236 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60239 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60275 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60276 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60279 - "GET /api/practices/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60281 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60283 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60285 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60288 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60307 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60310 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60327 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60326 - "GET /api/practices HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60330 - "GET /api/practices/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60332 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60334 - "GET /api/practices/6/boats/5/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60336 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60339 - "GET /api/practices/6/boats/6/gpx HTTP/1.1" 200 OK
