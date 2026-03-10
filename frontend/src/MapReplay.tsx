@@ -167,12 +167,22 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
   const [startLinePoints, setStartLinePoints] = useState<[number, number][]>([])
   const marksLayerRef = useRef<L.LayerGroup | null>(null)
   const startLineRef = useRef<L.Polyline | null>(null)
-  const markMarkersRef = useRef<Map<string, L.Marker>>(new Map()) // Track mark markers for dragging
+  const markMarkersRef = useRef<Map<string, L.Marker>>(new Map())
+  
+  // Use ref to track markMode for click handler (avoids re-registering handler)
+  const markModeRef = useRef(markMode)
+  markModeRef.current = markMode
   
   // Color picker popup state
   const [showColorPicker, setShowColorPicker] = useState(false)
   const [selectedBoatForColor, setSelectedBoatForColor] = useState<number | null>(null)
   const [colorPickerPosition, setColorPickerPosition] = useState<{ x: number; y: number } | null>(null)
+  
+  // Map rotation state
+  const [mapRotation, setMapRotation] = useState(0)
+  
+  // Weather state
+  const [weather, setWeather] = useState<{ direction: number; speed: number; gust: number } | null>(null)
 
   // Keep boats ref updated
   useEffect(() => {
@@ -217,12 +227,14 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
 
     // Handle clicks for adding marks (only when not in edit mode and when mark mode is active)
     mapRef.current.on('click', (e: L.LeafletMouseEvent) => {
+      const currentMarkMode = markModeRef.current
+      
       // Don't add marks in edit mode - that mode is for dragging
-      if (markMode === 'edit') return
+      if (currentMarkMode === 'edit') return
       
       const { lat, lng } = e.latlng
       
-      if (markMode === 'course') {
+      if (currentMarkMode === 'course') {
         // Add a course mark
         const newMark: Mark = {
           id: `mark-${Date.now()}`,
@@ -232,7 +244,7 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
           label: `M${marks.filter(m => m.type === 'course').length + 1}`
         }
         setMarks(prev => [...prev, newMark])
-      } else if (markMode === 'start' || markMode === 'finish') {
+      } else if (currentMarkMode === 'start' || currentMarkMode === 'finish') {
         // Add point to start/finish line (need 2 points)
         setStartLinePoints(prev => {
           const newPoints = [...prev, [lat, lng] as [number, number]]
@@ -692,6 +704,44 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
     }
   }, [markMode])
 
+  // Apply map rotation via CSS transform
+  useEffect(() => {
+    const mapContainer = document.querySelector('.leaflet-container') as HTMLElement
+    if (mapContainer) {
+      mapContainer.style.transform = `rotate(${mapRotation}deg)`
+    }
+  }, [mapRotation])
+
+  // Fetch weather from DCA
+  useEffect(() => {
+    const fetchWeather = async () => {
+      try {
+        // Fetch from NOAA DCA station
+        const response = await fetch('https://api.weather.gov/stations/KDCA/observations/latest')
+        const data = await response.json()
+        
+        if (data.properties) {
+          const windDir = data.properties.windDirection?.value || 0
+          const windSpeed = data.properties.windSpeed?.value || 0
+          const windGust = data.properties.windGust?.value || 0
+          
+          setWeather({
+            direction: windDir,
+            speed: windSpeed * 1.94384, // Convert m/s to knots
+            gust: windGust * 1.94384
+          })
+        }
+      } catch (err) {
+        console.error('Failed to fetch weather:', err)
+      }
+    }
+    
+    fetchWeather()
+    // Refresh every 5 minutes
+    const interval = setInterval(fetchWeather, 5 * 60 * 1000)
+    return () => clearInterval(interval)
+  }, [])
+
   // Playback animation
   useEffect(() => {
     if (!isPlaying || !startTime || !endTime) return
@@ -856,7 +906,105 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div ref={mapContainer} style={{ flex: 1, minHeight: '500px', borderRadius: '8px', overflow: 'hidden' }} />
+      <div style={{ flex: 1, minHeight: '500px', borderRadius: '8px', overflow: 'hidden', position: 'relative' }}>
+        <div ref={mapContainer} style={{ width: '100%', height: '100%' }} />
+        
+        {/* Map Rotation Control - Top Left */}
+        <div style={{
+          position: 'absolute',
+          top: '10px',
+          left: '10px',
+          zIndex: 1000,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '4px',
+          background: 'white',
+          padding: '8px',
+          borderRadius: '8px',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.15)'
+        }}>
+          <button
+            onClick={() => setMapRotation(prev => prev + 45)}
+            style={{
+              width: '32px',
+              height: '32px',
+              cursor: 'pointer',
+              background: '#f8f9fa',
+              border: '1px solid #ddd',
+              borderRadius: '4px',
+              fontSize: '16px'
+            }}
+            title="Rotate map 45° clockwise"
+          >
+            ↻
+          </button>
+          <button
+            onClick={() => setMapRotation(0)}
+            style={{
+              width: '32px',
+              height: '32px',
+              cursor: 'pointer',
+              background: '#f8f9fa',
+              border: '1px solid #ddd',
+              borderRadius: '4px',
+              fontSize: '12px'
+            }}
+            title="Reset rotation"
+          >
+            ⟲
+          </button>
+          <div style={{
+            textAlign: 'center',
+            fontSize: '10px',
+            color: '#666',
+            padding: '2px'
+          }}>
+            {mapRotation}°
+          </div>
+        </div>
+        
+        {/* Weather Display - Top Right */}
+        {weather && (
+          <div style={{
+            position: 'absolute',
+            top: '10px',
+            right: '10px',
+            zIndex: 1000,
+            background: 'white',
+            padding: '12px 16px',
+            borderRadius: '8px',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: '4px'
+          }}>
+            <div style={{ fontSize: '11px', color: '#666', fontWeight: 500 }}>DCA Weather</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div style={{ 
+                fontSize: '24px', 
+                transform: `rotate(${weather.direction}deg)`,
+                transition: 'transform 0.5s ease'
+              }}>
+                ➤
+              </div>
+              <div>
+                <div style={{ fontSize: '18px', fontWeight: 600, color: '#041E42' }}>
+                  {weather.speed.toFixed(1)} kts
+                </div>
+                {weather.gust > 0 && (
+                  <div style={{ fontSize: '11px', color: '#666' }}>
+                    gusts {weather.gust.toFixed(1)}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div style={{ fontSize: '10px', color: '#999' }}>
+              {weather.direction.toFixed(0)}° from N
+            </div>
+          </div>
+        )}
+      </div>
       
       {/* Speed Display Panel */}
       <div style={{ 
