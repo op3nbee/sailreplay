@@ -10,12 +10,108 @@ import urllib.request
 import json
 import sqlite3
 import gpxpy
+import gpxpy.gpx
 from jose import jwt
 from typing import Optional
 from pathlib import Path
 import html
+import math
 
 app = FastAPI()
+
+
+def filter_gpx_anomalies(gpx: gpxpy.gpx.GPX, max_speed_mps: float = 15.0) -> gpxpy.gpx.GPX:
+    """
+    Filter anomalous GPS points from a GPX track.
+    
+    Removes:
+    - Points with invalid coordinates (lat > 90, lon > 180, etc.)
+    - Points with sign errors (e.g., positive lon in western hemisphere)
+    - Points that would require unrealistic speed (> max_speed_mps m/s)
+    
+    Returns a cleaned GPX object.
+    """
+    cleaned_points = []
+    
+    for track in gpx.tracks:
+        for segment in track.segments:
+            prev_point = None
+            for point in segment.points:
+                # Check 1: Valid coordinate ranges
+                if not (-90 <= point.latitude <= 90):
+                    print(f"Filtered point with invalid latitude: {point.latitude}")
+                    continue
+                if not (-180 <= point.longitude <= 180):
+                    print(f"Filtered point with invalid longitude: {point.longitude}")
+                    continue
+                
+                # Check 2: Sign error detection (for Georgetown area ~ -77° longitude)
+                # If lon is positive but should be negative (western hemisphere)
+                if point.longitude > 0 and -90 <= point.latitude <= 90:
+                    # Check if flipping the sign would be close to previous/next points
+                    flipped_lon = -point.longitude
+                    if prev_point and -180 <= flipped_lon <= 180:
+                        dist_current = haversine_distance(
+                            point.latitude, point.longitude,
+                            prev_point.latitude, prev_point.longitude
+                        )
+                        dist_flipped = haversine_distance(
+                            point.latitude, flipped_lon,
+                            prev_point.latitude, prev_point.longitude
+                        )
+                        # If flipped sign gives much more reasonable distance, fix it
+                        if dist_flipped < dist_current / 10:
+                            print(f"Fixed sign error: lon {point.longitude} -> {flipped_lon}")
+                            point.longitude = flipped_lon
+                
+                # Check 3: Unrealistic speed (max_speed_mps m/s ≈ 30 knots)
+                if prev_point and point.time and prev_point.time:
+                    time_diff = (point.time - prev_point.time).total_seconds()
+                    if time_diff > 0:
+                        distance = haversine_distance(
+                            point.latitude, point.longitude,
+                            prev_point.latitude, prev_point.longitude
+                        )
+                        speed = distance / time_diff
+                        if speed > max_speed_mps:
+                            print(f"Filtered point with unrealistic speed: {speed:.1f} m/s")
+                            continue
+                
+                cleaned_points.append(point)
+                prev_point = point
+    
+    # Create new GPX with cleaned points
+    cleaned_gpx = gpxpy.gpx.GPX()
+    cleaned_track = gpxpy.gpx.GPXTrack()
+    cleaned_segment = gpxpy.gpx.GPXTrackSegment()
+    
+    for point in cleaned_points:
+        cleaned_segment.points.append(gpxpy.gpx.GPXTrackPoint(
+            latitude=point.latitude,
+            longitude=point.longitude,
+            time=point.time,
+            elevation=point.elevation
+        ))
+    
+    cleaned_track.segments.append(cleaned_segment)
+    cleaned_gpx.tracks.append(cleaned_track)
+    
+    return cleaned_gpx
+
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate distance in meters between two GPS points using Haversine formula."""
+    R = 6371000  # Earth's radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(delta_phi / 2) ** 2 + \
+        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    
+    return R * c
 
 # CORS - allow frontend
 app.add_middleware(
@@ -83,6 +179,16 @@ def init_db():
             start_time TIMESTAMP,
             end_time TIMESTAMP,
             FOREIGN KEY (boat_id) REFERENCES boats(id) ON DELETE CASCADE
+        );
+        
+        CREATE TABLE IF NOT EXISTS timeline_marks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            practice_id INTEGER NOT NULL,
+            time_offset INTEGER NOT NULL,  -- offset in seconds from start
+            label TEXT,
+            color TEXT DEFAULT '#ea4335',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (practice_id) REFERENCES practices(id) ON DELETE CASCADE
         );
     """)
     conn.commit()
@@ -277,6 +383,19 @@ def create_practice(
         # Save GPX file
         gpx_content = gpx_file.file.read()
         
+        # Fix incomplete GPX files missing closing tags
+        gpx_text = gpx_content.decode('utf-8', errors='ignore')
+        if not gpx_text.rstrip().endswith('</gpx>'):
+            print(f"Fixing incomplete GPX file: {gpx_file.filename}")
+            # Count open tags to determine what's missing
+            if '</trkpt>' in gpx_text and '</trkseg>' not in gpx_text:
+                gpx_text += '</trkseg>'
+            if '<trk' in gpx_text and '</trk>' not in gpx_text:
+                gpx_text += '</trk>'
+            if '<gpx' in gpx_text and '</gpx>' not in gpx_text:
+                gpx_text += '</gpx>'
+            gpx_content = gpx_text.encode('utf-8')
+        
         # Validate file size (max 10MB per file)
         if len(gpx_content) > 10 * 1024 * 1024:
             conn.close()
@@ -291,6 +410,17 @@ def create_practice(
         end_time = None
         try:
             gpx = gpxpy.parse(gpx_content)
+            
+            # Filter anomalous GPS points
+            original_points = sum(len(seg.points) for trk in gpx.tracks for seg in trk.segments)
+            gpx = filter_gpx_anomalies(gpx)
+            filtered_points = sum(len(seg.points) for trk in gpx.tracks for seg in trk.segments)
+            if filtered_points < original_points:
+                print(f"Filtered {original_points - filtered_points} anomalous points from {gpx_file.filename}")
+            
+            # Update gpx_content with cleaned data
+            gpx_content = gpx.to_xml().encode('utf-8')
+            
             if gpx.tracks and gpx.tracks[0].segments and gpx.tracks[0].segments[0].points:
                 start_time = gpx.tracks[0].segments[0].points[0].time
                 end_time = gpx.tracks[0].segments[0].points[-1].time
@@ -358,7 +488,14 @@ def get_boat_gpx(practice_id: int, boat_id: int, user: Optional[dict] = Depends(
     if not gpx_track:
         return JSONResponse({"error": "No GPX data"}, status_code=404)
     
-    return Response(gpx_track["gpx_data"], media_type="application/gpx+xml")
+    # Apply anomaly filter to any existing GPX data
+    try:
+        gpx = gpxpy.parse(gpx_track["gpx_data"].encode('utf-8'))
+        gpx = filter_gpx_anomalies(gpx)
+        return Response(gpx.to_xml(), media_type="application/gpx+xml")
+    except Exception as e:
+        print(f"Error filtering GPX: {e}")
+        return Response(gpx_track["gpx_data"], media_type="application/gpx+xml")
 
 @app.patch("/api/practices/{practice_id}/boats/{boat_id}")
 async def update_boat(practice_id: int, boat_id: int, request: Request, user: Optional[dict] = Depends(get_current_user)):
@@ -461,6 +598,44 @@ def get_weather():
         }
     except Exception as e:
         return {"error": f"Weather service unavailable: {str(e)}"}
+
+# ================== TIMELINE MARKS ==================
+
+@app.get("/api/practices/{practice_id}/marks")
+def get_timeline_marks(practice_id: int):
+    """Get all timeline marks for a practice"""
+    conn = get_db()
+    marks = conn.execute(
+        "SELECT * FROM timeline_marks WHERE practice_id = ? ORDER BY time_offset",
+        (practice_id,)
+    ).fetchall()
+    conn.close()
+    return [{"id": m["id"], "timeOffset": m["time_offset"], "label": m["label"], "color": m["color"]} for m in marks]
+
+
+@app.post("/api/practices/{practice_id}/marks")
+def add_timeline_mark(practice_id: int, timeOffset: int = Form(...), label: str = Form(""), color: str = Form("#ea4335")):
+    """Add a timeline mark at a specific time offset"""
+    conn = get_db()
+    cursor = conn.execute(
+        "INSERT INTO timeline_marks (practice_id, time_offset, label, color) VALUES (?, ?, ?, ?)",
+        (practice_id, timeOffset, label, color)
+    )
+    conn.commit()
+    mark_id = cursor.lastrowid
+    conn.close()
+    return {"id": mark_id, "timeOffset": timeOffset, "label": label, "color": color}
+
+
+@app.delete("/api/practices/{practice_id}/marks/{mark_id}")
+def delete_timeline_mark(practice_id: int, mark_id: int):
+    """Delete a timeline mark"""
+    conn = get_db()
+    conn.execute("DELETE FROM timeline_marks WHERE id = ? AND practice_id = ?", (mark_id, practice_id))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
 
 # ================== HEALTH ==================
 

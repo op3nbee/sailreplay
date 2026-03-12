@@ -181,6 +181,13 @@ interface Mark {
   label?: string
 }
 
+interface TimelineMark {
+  id: number
+  timeOffset: number  // seconds from start
+  label: string
+  color: string
+}
+
 interface MapReplayProps {
   practiceId: number
   boats: Boat[]
@@ -256,6 +263,7 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
   
   // Marks state
   const [marks, setMarks] = useState<Mark[]>([])
+  const [timelineMarks, setTimelineMarks] = useState<TimelineMark[]>([])
   const [markMode, setMarkMode] = useState<'none' | 'course' | 'start' | 'finish' | 'move' | 'delete'>('none')
   const marksLayerRef = useRef<L.LayerGroup | null>(null)
   const markMarkersRef = useRef<Map<string, L.Marker>>(new Map())
@@ -281,6 +289,15 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
   useEffect(() => {
     boatsRef.current = boats
   }, [boats])
+
+  // Fetch timeline marks when practice loads
+  useEffect(() => {
+    if (!practiceId) return
+    fetch(`/api/practices/${practiceId}/marks`)
+      .then(res => res.json())
+      .then(data => setTimelineMarks(data))
+      .catch(err => console.error('Failed to fetch timeline marks:', err))
+  }, [practiceId])
 
   // Initialize map
   useEffect(() => {
@@ -993,6 +1010,18 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
     onBoatUpdate?.(boatId, { color: newColor })
   }
 
+  // Center map on a specific boat
+  const centerOnBoat = (boatId: number) => {
+    const marker = markersRef.current.get(boatId)
+    if (marker && mapRef.current) {
+      const latlng = marker.getLatLng()
+      mapRef.current.setView([latlng.lat, latlng.lng], mapRef.current.getZoom(), {
+        animate: true,
+        duration: 0.5
+      })
+    }
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '600px' }}>
       <div style={{ flex: 1, minHeight: '500px', borderRadius: '8px', overflow: 'hidden', position: 'relative' }}>
@@ -1182,7 +1211,38 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
         border: '1px solid #e0e0e0'
       }}>
         {/* Timeline */}
-        <div style={{ marginBottom: '12px' }}>
+        <div style={{ marginBottom: '12px', position: 'relative' }}>
+          {/* Timeline marks display */}
+          {duration > 0 && timelineMarks.length > 0 && (
+            <div style={{ 
+              position: 'relative', 
+              height: '16px', 
+              marginBottom: '4px',
+              marginLeft: '4px',
+              marginRight: '4px'
+            }}>
+              {timelineMarks.map(mark => (
+                <div
+                  key={mark.id}
+                  onClick={() => setCurrentTime(mark.timeOffset)}
+                  title={`${mark.label || 'Mark'} - ${formatTime(mark.timeOffset)}`}
+                  style={{
+                    position: 'absolute',
+                    left: `${(mark.timeOffset / duration) * 100}%`,
+                    transform: 'translateX(-50%)',
+                    width: '12px',
+                    height: '12px',
+                    backgroundColor: mark.color,
+                    borderRadius: '50%',
+                    cursor: 'pointer',
+                    border: '2px solid white',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+                    zIndex: 10
+                  }}
+                />
+              ))}
+            </div>
+          )}
           <input
             type="range"
             min={0}
@@ -1238,6 +1298,40 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
               </button>
             ))}
           </div>
+
+          {/* Add Timeline Mark Button */}
+          {duration > 0 && (
+            <button
+              onClick={async () => {
+                const label = prompt('Enter mark label (optional):', `Mark at ${formatTime(currentTime)}`)
+                if (label === null) return // cancelled
+                try {
+                  const res = await fetch(`/api/practices/${practiceId}/marks`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: `timeOffset=${Math.round(currentTime)}&label=${encodeURIComponent(label || `Mark at ${formatTime(currentTime)}`)}&color=#ea4335`
+                  })
+                  if (res.ok) {
+                    const newMark = await res.json()
+                    setTimelineMarks(prev => [...prev, newMark].sort((a, b) => a.timeOffset - b.timeOffset))
+                  }
+                } catch (err) {
+                  console.error('Failed to add mark:', err)
+                }
+              }}
+              style={{
+                padding: '8px 16px',
+                fontSize: '13px',
+                cursor: 'pointer',
+                background: '#ea4335',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px'
+              }}
+            >
+              + Add Mark
+            </button>
+          )}
         </div>
 
         {/* Boat Legend with Controls */}
@@ -1365,32 +1459,33 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
               
               return (
                 <div 
-                  key={boat.id} 
-                  onClick={(e) => {
-                    const rect = (e.target as HTMLElement).getBoundingClientRect()
-                    // Open color picker upward (subtract popup height ~200px from top)
-                    setColorPickerPosition({ x: rect.left, y: rect.top - 200 })
-                    setSelectedBoatForColor(boat.id)
-                    setShowColorPicker(true)
-                  }}
+                  key={boat.id}
                   style={{ 
                     display: 'flex', 
                     alignItems: 'center', 
-                    gap: '6px',
-                    cursor: 'pointer',
+                    gap: '4px',
                     padding: '4px 8px',
                     borderRadius: '4px',
                     background: selectedBoatForColor === boat.id ? '#e3f2fd' : 'transparent'
                   }}
                 >
                   <span
+                    onClick={(e) => {
+                      const rect = (e.target as HTMLElement).getBoundingClientRect()
+                      // Open color picker upward (subtract popup height ~200px from top)
+                      setColorPickerPosition({ x: rect.left, y: rect.top - 200 })
+                      setSelectedBoatForColor(boat.id)
+                      setShowColorPicker(true)
+                    }}
                     style={{ 
                       width: '16px', 
                       height: '16px', 
                       background: currentColor, 
                       borderRadius: '3px',
-                      border: '1px solid rgba(0,0,0,0.2)'
+                      border: '1px solid rgba(0,0,0,0.2)',
+                      cursor: 'pointer'
                     }}
+                    title="Click to change color"
                   />
                   <span style={{ fontSize: '13px' }}>{boat.name}</span>
                   {boat.boat_type && (
@@ -1398,11 +1493,72 @@ function MapReplay({ practiceId, boats, onBoatUpdate }: MapReplayProps) {
                       {boat.boat_type}
                     </span>
                   )}
+                  <button
+                    onClick={() => centerOnBoat(boat.id)}
+                    title={`Center on ${boat.name}`}
+                    style={{
+                      background: 'none',
+                      border: 'none',
+                      cursor: 'pointer',
+                      padding: '2px 4px',
+                      fontSize: '14px',
+                      lineHeight: 1,
+                      opacity: 0.6,
+                      borderRadius: '3px'
+                    }}
+                  >
+                    ⦿
+                  </button>
                 </div>
               )
             })}
           </div>
         </div>
+
+        {/* Timeline Marks List */}
+        {timelineMarks.length > 0 && (
+          <div style={{ 
+            marginTop: '16px', 
+            paddingTop: '12px', 
+            borderTop: '1px solid #e0e0e0',
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: '8px',
+            alignItems: 'center'
+          }}>
+            <span style={{ fontSize: '13px', color: '#666', fontWeight: 500 }}>Timeline Marks:</span>
+            {timelineMarks.map(mark => (
+              <div
+                key={mark.id}
+                onClick={() => setCurrentTime(mark.timeOffset)}
+                onContextMenu={(e) => {
+                  e.preventDefault()
+                  if (confirm(`Delete mark "${mark.label}"?`)) {
+                    fetch(`/api/practices/${practiceId}/marks/${mark.id}`, { method: 'DELETE' })
+                      .then(() => setTimelineMarks(prev => prev.filter(m => m.id !== mark.id)))
+                      .catch(err => console.error('Failed to delete mark:', err))
+                  }
+                }}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  padding: '4px 8px',
+                  backgroundColor: mark.color,
+                  color: 'white',
+                  borderRadius: '12px',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                  opacity: Math.abs(currentTime - mark.timeOffset) < 2 ? 1 : 0.8
+                }}
+                title="Click to jump to mark. Right-click to delete."
+              >
+                <span>{formatTime(mark.timeOffset)}</span>
+                {mark.label && <span style={{ opacity: 0.8 }}>- {mark.label}</span>}
+              </div>
+            ))}
+          </div>
+        )}
         
         {/* Color Picker Popup */}
         {showColorPicker && selectedBoatForColor !== null && colorPickerPosition && (

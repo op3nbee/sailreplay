@@ -272,6 +272,7 @@ function CreatePractice({ onClose, onCreated }: { onClose: () => void, onCreated
           <label style={{ display: 'block', marginBottom: '6px', fontWeight: 500 }}>Upload GPX Files</label>
           <p style={{ margin: '0 0 10px', color: '#666', fontSize: '13px' }}>Select GPX files from your GPS logger or device</p>
           
+          {/* Hidden file input triggered by button */}
           <input 
             ref={fileInputRef}
             type="file" 
@@ -281,9 +282,13 @@ function CreatePractice({ onClose, onCreated }: { onClose: () => void, onCreated
             style={{ display: 'none' }}
           />
           
+          {/* Button to trigger file input */}
           <button 
             type="button"
-            onClick={() => fileInputRef.current?.click()}
+            onClick={() => {
+              console.log('Clicking file input...')
+              fileInputRef.current?.click()
+            }}
             style={{ 
               padding: '12px 20px', 
               cursor: 'pointer',
@@ -292,12 +297,13 @@ function CreatePractice({ onClose, onCreated }: { onClose: () => void, onCreated
               borderRadius: '4px',
               fontSize: '14px',
               width: '100%',
-              boxSizing: 'border-box'
+              boxSizing: 'border-box',
+              marginBottom: '8px'
             }}
           >
             📂 Select GPX Files
           </button>
-
+          
           {gpxFiles.length > 0 && (
             <div style={{ marginTop: '16px' }}>
               <p style={{ margin: '0 0 10px', fontWeight: 500 }}>{gpxFiles.length} file(s) selected</p>
